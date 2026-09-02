@@ -12,4 +12,7 @@
  * Implemented in M1 (IDE-6): OpId, compareId, Lamport clock rules, Item, Doc.
  */
 
-export {};
+export type { OpId } from './id.js';
+export { compareId } from './id.js';
+export type { Item, Op, InsertOp, DeleteOp } from './doc.js';
+export { Doc, CausalityError } from './doc.js';
