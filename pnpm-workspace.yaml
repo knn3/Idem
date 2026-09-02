@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# esbuild (vitest, tsx) and sharp (next/image) need their install scripts to run.
+onlyBuiltDependencies:
+  - esbuild
+  - sharp

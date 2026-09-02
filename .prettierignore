@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.next/
+coverage/
+pnpm-lock.yaml
+docs/reference/
+
+# Authored documents — kept byte-identical to their source.
+docs/
+CLAUDE.md
