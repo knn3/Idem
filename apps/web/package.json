@@ -10,8 +10,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@codemirror/state": "^6.7.2",
+    "@codemirror/view": "^6.43.10",
     "@idem/crdt": "workspace:*",
     "@idem/protocol": "workspace:*",
+    "codemirror": "^6.0.2",
     "next": "^15.1.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
