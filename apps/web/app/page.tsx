@@ -5,8 +5,8 @@ export default function HomePage() {
     <main>
       <h1>Idem</h1>
       <p>
-        A collaborative plain-text editor built on a hand-written RGA CRDT. Single-client for now —
-        live sync arrives in M6.
+        A collaborative plain-text editor built on a hand-written RGA CRDT. Open this page in two
+        tabs — edits sync live over WebSocket.
       </p>
       <Editor />
     </main>
