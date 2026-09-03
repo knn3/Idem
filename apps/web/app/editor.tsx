@@ -6,8 +6,10 @@ import { Doc, type Op } from '@idem/crdt';
 import { parseServerMessage, serializeMessage, type ServerMessage } from '@idem/protocol';
 import { useEffect, useRef, useState } from 'react';
 
-// No doc list until M11 — every tab joins the same fixed room for now.
-const DOC_ID = 'demo';
+// No doc list until M11 — every tab joins the same fixed room for now. Must
+// match DEV_DOC_ID in apps/server/src/dev-seed.ts: op_log.doc_id is a real
+// foreign key into `document`, so this has to be a row that actually exists.
+const DOC_ID = '00000000-0000-0000-0000-000000000002';
 const WS_URL = (process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8787') + '/ws';
 
 /** Marks a CodeMirror transaction as applying a remote op, so the update
