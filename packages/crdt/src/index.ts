@@ -10,9 +10,13 @@
  * oracle at docs/reference/rga-harness.mjs. Port it; do not reinvent it.
  *
  * Implemented in M1 (IDE-6): OpId, compareId, Lamport clock rules, Item, Doc.
+ * Implemented in M3 (IDE-8): index mapping and cursor anchors.
  */
 
 export type { OpId } from './id.js';
 export { compareId } from './id.js';
 export type { Item, Op, InsertOp, DeleteOp } from './doc.js';
 export { Doc, CausalityError } from './doc.js';
+export { visibleToItemIndex, itemToVisibleIndex, toString } from './index-map.js';
+export type { CursorAnchor, Selection } from './cursor.js';
+export { anchorToVisibleIndex, visibleIndexToAnchor } from './cursor.js';
