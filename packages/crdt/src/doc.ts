@@ -1,4 +1,5 @@
 import { type OpId, compareId, idEqual, idKey } from './id.js';
+import { toString as itemsToString } from './index-map.js';
 
 /**
  * One character in the document. Items are never removed from `Doc.items` —
@@ -54,9 +55,7 @@ export class Doc {
   }
 
   toString(): string {
-    return this.visibleItems()
-      .map((item) => item.content)
-      .join('');
+    return itemsToString(this.items);
   }
 
   /**
