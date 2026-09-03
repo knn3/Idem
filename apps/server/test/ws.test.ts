@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
 import { createServer } from '../src/index.js';
+import { createMemoryStore } from '../src/store.js';
 
 /**
  * Integration test for the day-12 checkpoint: real ws connections against a
@@ -25,7 +26,7 @@ afterEach(async () => {
 });
 
 async function startServer(): Promise<string> {
-  app = createServer();
+  app = createServer({ store: createMemoryStore() });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const { port } = app.server.address() as AddressInfo;
   return `ws://127.0.0.1:${port}/ws`;
