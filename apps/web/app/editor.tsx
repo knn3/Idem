@@ -3,7 +3,12 @@
 import { Annotation, type ChangeSet, EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { Doc, type Op } from '@idem/crdt';
-import { parseServerMessage, serializeMessage, type ServerMessage } from '@idem/protocol';
+import {
+  parseServerMessage,
+  serializeMessage,
+  type ServerMessage,
+  type Snapshot,
+} from '@idem/protocol';
 import { useEffect, useRef, useState } from 'react';
 
 // No doc list until M11 — every tab joins the same fixed room for now. Must
@@ -23,6 +28,11 @@ const remoteSync = Annotation.define<boolean>();
  * and reflected into the editor. `doc.apply` is idempotent (CLAUDE.md hard
  * rule 5), so a client's own op coming back from the server is a no-op —
  * no special-casing needed to avoid an echo loop.
+ *
+ * M8 adds the catch-up path: `welcome` may carry a snapshot, which the client
+ * hydrates from instead of replaying history, and the client tracks the
+ * highest `seq` it has applied so a reconnect asks only for what it missed.
+ * The offline outbox that makes that reconnect lossless is M9.
  */
 export function Editor() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -34,22 +44,50 @@ export function Editor() {
     const container = containerRef.current;
     if (!container) return;
 
-    const doc = new Doc(crypto.randomUUID());
+    // One replica id for the whole session (SPEC §1). It outlives `doc`, which
+    // is replaced wholesale when the server hands us a snapshot.
+    const replica = crypto.randomUUID();
+    let doc = new Doc(replica);
     const opLog: Op[] = [];
+    /** Highest `seq` applied — sent as `sinceSeq` so a reconnect asks only for what it missed. */
+    let sinceSeq = 0;
+    let helloSentAt = 0;
 
     function sendOps(ops: Op[]): void {
       if (ops.length === 0 || ws.readyState !== WebSocket.OPEN) return;
       ws.send(serializeMessage({ t: 'ops', ops }));
     }
 
-    function applyRemoteOps(ops: readonly Op[]): void {
-      for (const op of ops) doc.apply(op);
-      const oldText = view.state.doc.toString();
+    /** Pushes `doc`'s text into CodeMirror as a single minimal replacement. */
+    function renderDoc(): void {
       const newText = doc.toString();
-      const change = diffReplace(oldText, newText);
+      const change = diffReplace(view.state.doc.toString(), newText);
       if (!change) return;
       view.dispatch({ changes: change, annotations: [remoteSync.of(true)] });
       setMirrorText(newText);
+    }
+
+    function applyRemoteOps(ops: readonly Op[]): void {
+      for (const op of ops) doc.apply(op);
+      renderDoc();
+    }
+
+    /**
+     * `welcome` is either snapshot-plus-tail or tail alone (SPEC §6). Hydrating
+     * from the snapshot is what keeps opening a long document cheap: the client
+     * skips integrating the history and only replays the ops after it.
+     */
+    function applyWelcome(snapshot: Snapshot | null, ops: readonly Op[], seq: number): void {
+      if (snapshot) doc = Doc.fromItems(replica, snapshot.items);
+      for (const op of ops) doc.apply(op);
+      sinceSeq = seq;
+      renderDoc();
+      // M8's acceptance criterion is a wall-clock number, so the client
+      // reports its own: hello sent → text on screen. See docs/BENCHMARKS.md.
+      console.info(
+        `[idem] loaded in ${(performance.now() - helloSentAt).toFixed(0)} ms ` +
+          `(snapshot ${snapshot ? `${snapshot.items.length} items` : 'none'}, tail ${ops.length} ops, seq ${seq})`,
+      );
     }
 
     const view = new EditorView({
@@ -74,7 +112,8 @@ export function Editor() {
     const ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
       setConnected(true);
-      ws.send(serializeMessage({ t: 'hello', docId: DOC_ID, replica: doc.replica, sinceSeq: 0 }));
+      helloSentAt = performance.now();
+      ws.send(serializeMessage({ t: 'hello', docId: DOC_ID, replica, sinceSeq }));
     });
     ws.addEventListener('close', () => setConnected(false));
     ws.addEventListener('message', (event: MessageEvent<string>) => {
@@ -85,8 +124,11 @@ export function Editor() {
         console.error('discarding invalid server message', err);
         return;
       }
-      if (message.t === 'welcome' || message.t === 'ops') {
+      if (message.t === 'welcome') {
+        applyWelcome(message.snapshot, message.ops, message.seq);
+      } else if (message.t === 'ops') {
         applyRemoteOps(message.ops);
+        sinceSeq = message.seq;
       } else if (message.t === 'error') {
         console.error(`server rejected a message [${message.code}]: ${message.message}`);
       }

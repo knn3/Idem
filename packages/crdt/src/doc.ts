@@ -45,6 +45,44 @@ export class Doc {
     this.replica = replica;
   }
 
+  /**
+   * Rebuilds a document from a materialized item list — a snapshot (SPEC §9),
+   * loaded instead of replaying the log from the beginning. Integration is
+   * skipped entirely: the items are already in their converged order, and
+   * re-integrating them would be both wasteful and wrong (their origins are
+   * relative to a list that already contains them).
+   *
+   * Two things a snapshot cannot carry, both safe:
+   *
+   * 1. **Delete-op ids.** An item records *that* it is a tombstone, not the
+   *    `OpId` of the operation that made it one, so those ids are missing from
+   *    `applied`. A delete already reflected here can therefore be applied a
+   *    second time — which is a no-op, because `integrateDelete` only ever
+   *    sets `deleted = true` (hard rule 5). Convergence is unaffected.
+   *
+   * 2. **A delete op's Lamport value.** The clock is seeded from the highest
+   *    item id, so a delete that outran every insert leaves the clock low.
+   *    Harmless: ids stay globally unique because `replica` is unique per
+   *    session, and SPEC §7 states outright that RGA needs causal order, not
+   *    Lamport order. A low clock only shifts an arbitrary tiebreak.
+   */
+  static fromItems(replica: string, items: readonly Item[]): Doc {
+    const doc = new Doc(replica);
+    for (const item of items) {
+      // Copied, not aliased: `deleted` is mutable, and the caller's array is
+      // typically a parsed wire message the room still holds a reference to.
+      doc.items.push({
+        id: item.id,
+        originLeft: item.originLeft,
+        content: item.content,
+        deleted: item.deleted,
+      });
+      doc.applied.add(idKey(item.id));
+      doc.clock = Math.max(doc.clock, item.id.lamport);
+    }
+    return doc;
+  }
+
   private indexOfItem(id: OpId): number {
     return this.items.findIndex((item) => idEqual(item.id, id));
   }
