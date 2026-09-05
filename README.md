@@ -78,6 +78,7 @@ packages/protocol  zod schemas for every wire message; shared by both apps.
 docs/SPEC.md       Source of truth for the algorithm
 docs/PLAN.md       Milestone order and acceptance criteria
 docs/PROPOSAL.md   Scope, success criteria, stack rationale
+docs/BENCHMARKS.md Measured numbers, with the conditions they were measured under
 docs/reference/    A verified JS implementation of the algorithm — the oracle
 ```
 
