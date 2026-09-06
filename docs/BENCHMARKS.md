@@ -39,8 +39,12 @@ The client prints this itself — open the console on any document and you get
 the line, so the number is re-measurable rather than a claim in a file:
 
 ```
-[idem] loaded in 85 ms (snapshot 10000 items, tail 0 ops, seq 10000)
+[idem] loaded in 85 ms (snapshot 10000 items, tail 0 ops, seq 10000, resent 0 queued ops)
 ```
+
+M9 added the queued-operation count to the end of that line; the numbers in the
+table above were measured before it existed and are unaffected by it — an empty
+outbox costs one array read.
 
 The first load is slower because the server had not yet loaded the room. That
 cost is real and belongs in the number: it is what a tab hits after a deploy.

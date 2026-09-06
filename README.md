@@ -8,7 +8,13 @@ The conflict resolution is **not** Yjs, Automerge, or ShareDB. It is a Replicate
 
 _Idem_ — from **idempotent**, the property that applying an operation twice changes nothing, which is what makes replay and reconnection safe. Also Latin for _"the same"_, which is what convergence means. The name is the thesis.
 
-> **Status:** in progress. Milestones are tracked in [`docs/PLAN.md`](docs/PLAN.md); a demo GIF lands here when M9 does.
+![Two windows, both offline, conflicting edits, identical text after reconnect](docs/demo/offline-merge.gif)
+
+Two windows, both offline, both typing a different time into the same sentence.
+The network comes back and neither is asked to choose. This is a recording of
+`e2e/offline.spec.ts` against the real stack — see [`docs/DEMO.md`](docs/DEMO.md).
+
+> **Status:** in progress through M9. Milestones are tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ---
 
@@ -63,7 +69,7 @@ pnpm typecheck
 pnpm lint
 pnpm db:push        # push Drizzle schema
 pnpm db:studio      # inspect the database
-pnpm e2e            # Playwright
+pnpm e2e            # Playwright — needs DATABASE_URL; see docs/DEMO.md
 ```
 
 ---
@@ -79,6 +85,7 @@ docs/SPEC.md       Source of truth for the algorithm
 docs/PLAN.md       Milestone order and acceptance criteria
 docs/PROPOSAL.md   Scope, success criteria, stack rationale
 docs/BENCHMARKS.md Measured numbers, with the conditions they were measured under
+docs/DEMO.md       The offline demo: what it shows, how to run and re-record it
 docs/reference/    A verified JS implementation of the algorithm — the oracle
 ```
 
@@ -93,7 +100,7 @@ docs/reference/    A verified JS implementation of the algorithm — the oracle
 | Unit                    | Hand-built concurrent scenarios for the CRDT                                                                          |
 | Property (`fast-check`) | Random operation sequences applied in random causally-valid orders across simulated replicas; assert convergence      |
 | Fuzz                    | A seeded `SimNetwork` with delay, reordering, duplication and partitions — deterministic and replayable from the seed |
-| E2E (Playwright)        | Two browser contexts, real convergence assertion                                                                      |
+| E2E (Playwright)        | Two browser contexts, real convergence assertion — connected, and after both have been offline                        |
 
 Any change to `packages/crdt` must keep `pnpm test:prop` green at 1,000 cases.
 

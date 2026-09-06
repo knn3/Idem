@@ -2,14 +2,11 @@
 
 import { Annotation, type ChangeSet, EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
-import { Doc, type Op } from '@idem/crdt';
-import {
-  parseServerMessage,
-  serializeMessage,
-  type ServerMessage,
-  type Snapshot,
-} from '@idem/protocol';
+import { type Doc, type Op } from '@idem/crdt';
 import { useEffect, useRef, useState } from 'react';
+
+import { createOutbox } from './sync/outbox';
+import { SyncClient, type SyncState } from './sync/sync-client';
 
 // No doc list until M11 — every tab joins the same fixed room for now. Must
 // match DEV_DOC_ID in apps/server/src/dev-seed.ts: op_log.doc_id is a real
@@ -22,72 +19,41 @@ const WS_URL = (process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8787') + '/ws'
 const remoteSync = Annotation.define<boolean>();
 
 /**
- * M6: CodeMirror driving a `Doc` that's synced live over WebSocket (M4 was
- * single-client). Local edits become ops, applied immediately and sent to
- * the server; the server's `ops`/`welcome` broadcasts are applied to `doc`
- * and reflected into the editor. `doc.apply` is idempotent (CLAUDE.md hard
- * rule 5), so a client's own op coming back from the server is a no-op —
- * no special-casing needed to avoid an echo loop.
+ * CodeMirror bound to a `Doc` that a `SyncClient` keeps in step with the
+ * server. This component owns the editor and nothing else: local edits become
+ * operations, which are applied immediately and handed to the client; whatever
+ * the client applies to the document is rendered back.
  *
- * M8 adds the catch-up path: `welcome` may carry a snapshot, which the client
- * hydrates from instead of replaying history, and the client tracks the
- * highest `seq` it has applied so a reconnect asks only for what it missed.
- * The offline outbox that makes that reconnect lossless is M9.
+ * M9 makes that binding survive a dead network. Operations go into a persisted
+ * outbox and leave it only on acknowledgement, so typing while offline is
+ * ordinary typing — the text is in the document the moment it is typed, and
+ * the queue drains on reconnect. See `sync/sync-client.ts`.
  */
 export function Editor() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mirrorText, setMirrorText] = useState('');
   const [opCount, setOpCount] = useState(0);
-  const [connected, setConnected] = useState(false);
+  const [sync, setSync] = useState<SyncState>({ status: 'connecting', pending: 0 });
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    // One replica id for the whole session (SPEC §1). It outlives `doc`, which
-    // is replaced wholesale when the server hands us a snapshot.
+    // One replica id per session (SPEC §1). A reload mints a new one — which is
+    // why the outbox is keyed by document, not by replica: operations queued
+    // under the old id are still operations the server has never seen.
     const replica = crypto.randomUUID();
-    let doc = new Doc(replica);
     const opLog: Op[] = [];
-    /** Highest `seq` applied — sent as `sinceSeq` so a reconnect asks only for what it missed. */
-    let sinceSeq = 0;
-    let helloSentAt = 0;
+    let client: SyncClient | null = null;
+    let disposed = false;
 
-    function sendOps(ops: Op[]): void {
-      if (ops.length === 0 || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(serializeMessage({ t: 'ops', ops }));
-    }
-
-    /** Pushes `doc`'s text into CodeMirror as a single minimal replacement. */
-    function renderDoc(): void {
+    /** Pushes the document's text into CodeMirror as a single minimal replacement. */
+    function renderDoc(doc: Doc): void {
       const newText = doc.toString();
       const change = diffReplace(view.state.doc.toString(), newText);
       if (!change) return;
       view.dispatch({ changes: change, annotations: [remoteSync.of(true)] });
       setMirrorText(newText);
-    }
-
-    function applyRemoteOps(ops: readonly Op[]): void {
-      for (const op of ops) doc.apply(op);
-      renderDoc();
-    }
-
-    /**
-     * `welcome` is either snapshot-plus-tail or tail alone (SPEC §6). Hydrating
-     * from the snapshot is what keeps opening a long document cheap: the client
-     * skips integrating the history and only replays the ops after it.
-     */
-    function applyWelcome(snapshot: Snapshot | null, ops: readonly Op[], seq: number): void {
-      if (snapshot) doc = Doc.fromItems(replica, snapshot.items);
-      for (const op of ops) doc.apply(op);
-      sinceSeq = seq;
-      renderDoc();
-      // M8's acceptance criterion is a wall-clock number, so the client
-      // reports its own: hello sent → text on screen. See docs/BENCHMARKS.md.
-      console.info(
-        `[idem] loaded in ${(performance.now() - helloSentAt).toFixed(0)} ms ` +
-          `(snapshot ${snapshot ? `${snapshot.items.length} items` : 'none'}, tail ${ops.length} ops, seq ${seq})`,
-      );
     }
 
     const view = new EditorView({
@@ -96,60 +62,106 @@ export function Editor() {
         extensions: [
           basicSetup,
           EditorView.updateListener.of((update) => {
-            if (!update.docChanged) return;
+            if (!update.docChanged || !client) return;
             if (update.transactions.some((tr) => tr.annotation(remoteSync))) return;
-            const newOps = applyChangesToDoc(doc, update.changes);
+            const newOps = applyChangesToDoc(client.doc, update.changes);
             opLog.push(...newOps);
             console.table(opLog.map(describeOp));
-            setMirrorText(doc.toString());
+            setMirrorText(client.doc.toString());
             setOpCount(opLog.length);
-            sendOps(newOps);
+            client.push(newOps);
           }),
         ],
       }),
     });
 
-    const ws = new WebSocket(WS_URL);
-    ws.addEventListener('open', () => {
-      setConnected(true);
-      helloSentAt = performance.now();
-      ws.send(serializeMessage({ t: 'hello', docId: DOC_ID, replica, sinceSeq }));
-    });
-    ws.addEventListener('close', () => setConnected(false));
-    ws.addEventListener('message', (event: MessageEvent<string>) => {
-      let message: ServerMessage;
-      try {
-        message = parseServerMessage(event.data);
-      } catch (err) {
-        console.error('discarding invalid server message', err);
-        return;
-      }
-      if (message.t === 'welcome') {
-        applyWelcome(message.snapshot, message.ops, message.seq);
-      } else if (message.t === 'ops') {
-        applyRemoteOps(message.ops);
-        sinceSeq = message.seq;
-      } else if (message.t === 'error') {
-        console.error(`server rejected a message [${message.code}]: ${message.message}`);
-      }
-      // 'presence' arrives in M10.
-    });
+    const retryNow = () => client?.retryNow();
+
+    void (async () => {
+      const outbox = await createOutbox(DOC_ID);
+      if (disposed) return;
+      client = new SyncClient({
+        url: WS_URL,
+        docId: DOC_ID,
+        replica,
+        outbox,
+        onChange: () => {
+          // Read the getter every time: a snapshot replaces the document.
+          if (client) renderDoc(client.doc);
+        },
+        onState: setSync,
+      });
+      // The browser knows the network is back before a backoff timer does.
+      window.addEventListener('online', retryNow);
+      await client.start();
+    })();
 
     return () => {
-      ws.close();
+      disposed = true;
+      window.removeEventListener('online', retryNow);
+      client?.destroy();
       view.destroy();
     };
   }, []);
 
   return (
     <div>
+      <ConnectionIndicator state={sync} />
       <div ref={containerRef} />
       <p>
-        <strong>doc.toString():</strong> {connected ? '(synced)' : '(offline)'}
+        <strong>doc.toString():</strong>
       </p>
-      <pre style={{ whiteSpace: 'pre', margin: 0 }}>{mirrorText}</pre>
+      <pre data-testid="doc-text" style={{ whiteSpace: 'pre', margin: 0 }}>
+        {mirrorText}
+      </pre>
       <p>{opCount} operations applied locally — full stream logged to the console.</p>
     </div>
+  );
+}
+
+const STATUS_LABEL = {
+  online: 'Online',
+  connecting: 'Connecting…',
+  offline: 'Offline',
+} as const;
+
+const STATUS_COLOR = {
+  online: '#12805c',
+  connecting: '#9a6700',
+  offline: '#b42318',
+} as const;
+
+/**
+ * The connection indicator. It reports the queue depth as well as the status,
+ * because "offline" alone does not answer the question the user actually has
+ * while the network is down: *is my typing safe?*
+ */
+function ConnectionIndicator({ state }: { state: SyncState }) {
+  const color = STATUS_COLOR[state.status];
+  return (
+    <p
+      data-testid="connection-indicator"
+      data-status={state.status}
+      data-pending={state.pending}
+      style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: '0 0 0.5rem' }}
+    >
+      <span
+        aria-hidden
+        style={{
+          width: '0.6rem',
+          height: '0.6rem',
+          borderRadius: '50%',
+          background: color,
+          display: 'inline-block',
+        }}
+      />
+      <strong style={{ color }}>{STATUS_LABEL[state.status]}</strong>
+      <span>
+        {state.pending === 0
+          ? 'all edits acknowledged'
+          : `${state.pending} edit${state.pending === 1 ? '' : 's'} queued`}
+      </span>
+    </p>
   );
 }
 
