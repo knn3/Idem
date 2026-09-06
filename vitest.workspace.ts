@@ -28,6 +28,13 @@ export default defineWorkspace([
   },
   {
     test: {
+      name: 'web',
+      root: './apps/web',
+      include: ['test/**/*.test.ts'],
+    },
+  },
+  {
+    test: {
       name: 'server',
       root: './apps/server',
       include: ['test/**/*.test.ts'],
