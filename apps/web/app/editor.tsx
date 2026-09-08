@@ -2,10 +2,13 @@
 
 import { Annotation, type ChangeSet, EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
-import { type Doc, type Op } from '@idem/crdt';
+import { visibleIndexToAnchor, type CursorAnchor, type Doc, type Op } from '@idem/crdt';
+import type { Peer } from '@idem/protocol';
 import { useEffect, useRef, useState } from 'react';
 
+import { peerCursors, setPeerRanges } from './peer-cursors';
 import { createOutbox } from './sync/outbox';
+import { resolvePeerRanges } from './sync/presence';
 import { SyncClient, type SyncState } from './sync/sync-client';
 
 // No doc list until M11 — every tab joins the same fixed room for now. Must
@@ -28,12 +31,17 @@ const remoteSync = Annotation.define<boolean>();
  * outbox and leave it only on acknowledgement, so typing while offline is
  * ordinary typing — the text is in the document the moment it is typed, and
  * the queue drains on reconnect. See `sync/sync-client.ts`.
+ *
+ * M10 adds presence. Remote carets are decorations resolved from `OpId`
+ * anchors against the current document, recomputed after every change rather
+ * than transformed — see `sync/presence.ts` and `peer-cursors.ts`.
  */
 export function Editor() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mirrorText, setMirrorText] = useState('');
   const [opCount, setOpCount] = useState(0);
   const [sync, setSync] = useState<SyncState>({ status: 'connecting', pending: 0 });
+  const [peerCount, setPeerCount] = useState(0);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -46,6 +54,41 @@ export function Editor() {
     const opLog: Op[] = [];
     let client: SyncClient | null = null;
     let disposed = false;
+    let peers: readonly Peer[] = [];
+
+    /**
+     * Re-resolves every peer anchor against the current document and hands the
+     * result to the decoration field.
+     *
+     * Called after *every* change, local or remote, rather than relying on
+     * CodeMirror to map the old positions forward. Anchors are the truth
+     * (SPEC §8); recomputing from them is what makes a remote caret sit
+     * correctly whether you type before it, after it, or on top of it.
+     */
+    function refreshPeers(): void {
+      if (disposed || !client) return;
+      view.dispatch({
+        effects: setPeerRanges.of(resolvePeerRanges(client.doc.items, peers, replica)),
+      });
+    }
+
+    /** Sends this replica's cursor as two anchors — never as offsets. */
+    function sendPresence(): void {
+      if (!client) return;
+      const items = client.doc.items;
+      const range = view.state.selection.main;
+      let anchor: CursorAnchor;
+      let focus: CursorAnchor;
+      try {
+        anchor = visibleIndexToAnchor(items, range.anchor);
+        focus = visibleIndexToAnchor(items, range.head);
+      } catch {
+        // The selection is briefly ahead of the document — a remote change is
+        // mid-flight. The next event resends it.
+        return;
+      }
+      client.setPresence(anchor, focus);
+    }
 
     /** Pushes the document's text into CodeMirror as a single minimal replacement. */
     function renderDoc(doc: Doc): void {
@@ -61,15 +104,27 @@ export function Editor() {
       state: EditorState.create({
         extensions: [
           basicSetup,
+          peerCursors(),
           EditorView.updateListener.of((update) => {
-            if (!update.docChanged || !client) return;
-            if (update.transactions.some((tr) => tr.annotation(remoteSync))) return;
-            const newOps = applyChangesToDoc(client.doc, update.changes);
-            opLog.push(...newOps);
-            console.table(opLog.map(describeOp));
-            setMirrorText(client.doc.toString());
-            setOpCount(opLog.length);
-            client.push(newOps);
+            if (!client) return;
+            const local =
+              update.docChanged && !update.transactions.some((tr) => tr.annotation(remoteSync));
+            if (local) {
+              const newOps = applyChangesToDoc(client.doc, update.changes);
+              opLog.push(...newOps);
+              console.table(opLog.map(describeOp));
+              setMirrorText(client.doc.toString());
+              setOpCount(opLog.length);
+              client.push(newOps);
+            }
+            if (!update.docChanged && !update.selectionSet) return;
+            // Deferred: dispatching from inside an update listener is not
+            // allowed, and both of these dispatch or send.
+            queueMicrotask(() => {
+              if (disposed) return;
+              sendPresence();
+              refreshPeers();
+            });
           }),
         ],
       }),
@@ -88,8 +143,17 @@ export function Editor() {
         onChange: () => {
           // Read the getter every time: a snapshot replaces the document.
           if (client) renderDoc(client.doc);
+          refreshPeers();
+          // A remote change can move this replica's own cursor, which makes its
+          // anchors different from the ones the peers were last told about.
+          sendPresence();
         },
         onState: setSync,
+        onPeers: (next) => {
+          peers = next;
+          setPeerCount(next.length);
+          refreshPeers();
+        },
       });
       // The browser knows the network is back before a backoff timer does.
       window.addEventListener('online', retryNow);
@@ -114,7 +178,10 @@ export function Editor() {
       <pre data-testid="doc-text" style={{ whiteSpace: 'pre', margin: 0 }}>
         {mirrorText}
       </pre>
-      <p>{opCount} operations applied locally — full stream logged to the console.</p>
+      <p data-testid="peer-count" data-peers={peerCount}>
+        {opCount} operations applied locally — full stream logged to the console.
+        {peerCount > 0 && ` ${peerCount} other ${peerCount === 1 ? 'person' : 'people'} here.`}
+      </p>
     </div>
   );
 }

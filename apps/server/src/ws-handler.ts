@@ -35,7 +35,11 @@ export function handleConnection(ws: WebSocket, registry: RoomRegistry): void {
           const room = await registry.getOrCreate(message.docId);
           joined = { room, replica: message.replica };
           room.join({ replica: message.replica, send: (raw) => ws.send(raw) });
+          // `welcome` before the roster, always. A peer's anchors name items in
+          // the document, so a client that saw presence first could be asked to
+          // place a caret against a state it has not been sent yet.
           ws.send(serializeMessage(room.welcome(message.sinceSeq)));
+          room.broadcastPresence();
           return;
         }
 
@@ -51,9 +55,13 @@ export function handleConnection(ws: WebSocket, registry: RoomRegistry): void {
           return;
         }
 
-        // 'presence': the schema accepts it (SPEC §6) but broadcasting peers with
-        // names and colors is M10 scope. Accepting and dropping it keeps this
-        // connection forward-compatible without building presence early.
+        // 'presence' (M10): ephemeral, so it is recorded in the room and
+        // rebroadcast, and never written to the store (SPEC §8). The roster
+        // goes to everyone including the sender — one message shape for every
+        // client beats a per-recipient filtered copy, and the client drops its
+        // own entry when it renders.
+        joined.room.setPresence(joined.replica, message.anchor, message.focus);
+        joined.room.broadcastPresence();
       } catch (err) {
         if (err instanceof ProtocolError) {
           sendError(ws, err.code, err.message);
@@ -65,6 +73,11 @@ export function handleConnection(ws: WebSocket, registry: RoomRegistry): void {
   });
 
   ws.on('close', () => {
-    if (joined) joined.room.leave(joined.replica);
+    if (!joined) return;
+    joined.room.leave(joined.replica);
+    // Peers are dropped on disconnect (PLAN.md M10): the remaining clients are
+    // told immediately rather than being left with a caret that will never move
+    // again.
+    joined.room.broadcastPresence();
   });
 }

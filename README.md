@@ -14,7 +14,7 @@ Two windows, both offline, both typing a different time into the same sentence.
 The network comes back and neither is asked to choose. This is a recording of
 `e2e/offline.spec.ts` against the real stack — see [`docs/DEMO.md`](docs/DEMO.md).
 
-> **Status:** in progress through M9. Milestones are tracked in [`docs/PLAN.md`](docs/PLAN.md).
+> **Status:** in progress through M10. Milestones are tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ---
 

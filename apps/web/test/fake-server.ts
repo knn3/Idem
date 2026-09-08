@@ -1,5 +1,5 @@
 import { Doc, type Item, type Op, type OpId } from '@idem/crdt';
-import { parseClientMessage, serializeMessage } from '@idem/protocol';
+import { parseClientMessage, serializeMessage, type Peer } from '@idem/protocol';
 
 import type { Connect, SocketHandlers, SyncSocket } from '../app/sync/sync-client';
 
@@ -37,10 +37,13 @@ function opKey(id: OpId): string {
 interface Connection {
   readonly handlers: SocketHandlers;
   open: boolean;
+  /** Set on `hello`; presence is keyed by it, exactly as the real room is. */
+  replica: string | null;
 }
 
 export function createFakeNetwork(): FakeNetwork {
   const connections = new Set<Connection>();
+  const presence = new Map<string, Peer>();
   const seen = new Set<string>();
   const accepted: Op[] = [];
   let tail: { seq: number; op: Op }[] = [];
@@ -66,9 +69,31 @@ export function createFakeNetwork(): FakeNetwork {
     }
   }
 
+  /** Mirrors `Room.broadcastPresence`: ephemeral, never logged, sent to everyone. */
+  function broadcastPresence(): void {
+    broadcast(serializeMessage({ t: 'presence', peers: [...presence.values()] }));
+  }
+
   function receive(connection: Connection, raw: string): void {
     const message = parseClientMessage(raw);
+    if (message.t === 'presence') {
+      const peer = connection.replica === null ? undefined : presence.get(connection.replica);
+      if (!peer) return;
+      presence.set(peer.replica, { ...peer, anchor: message.anchor, focus: message.focus });
+      broadcastPresence();
+      return;
+    }
     if (message.t === 'hello') {
+      connection.replica = message.replica;
+      presence.set(message.replica, {
+        replica: message.replica,
+        // The real server hands out a palette entry; the fake only has to be a
+        // faithful *shape*, and the client never interprets either field.
+        name: `peer-${message.replica}`,
+        color: '#123456',
+        anchor: null,
+        focus: null,
+      });
       const behindSnapshot = message.sinceSeq < snapshotSeq;
       const welcome = serializeMessage({
         t: 'welcome',
@@ -81,6 +106,7 @@ export function createFakeNetwork(): FakeNetwork {
       queueMicrotask(() => {
         if (connection.open) connection.handlers.onMessage(welcome);
       });
+      broadcastPresence();
       return;
     }
     if (message.t !== 'ops') return;
@@ -103,13 +129,15 @@ export function createFakeNetwork(): FakeNetwork {
     for (const connection of connections) {
       if (!connection.open) continue;
       connection.open = false;
+      if (connection.replica !== null) presence.delete(connection.replica);
       queueMicrotask(() => connection.handlers.onClose());
     }
     connections.clear();
+    broadcastPresence();
   }
 
   const connect: Connect = (_url, handlers): SyncSocket => {
-    const connection: Connection = { handlers, open: online };
+    const connection: Connection = { handlers, open: online, replica: null };
     if (!online) {
       queueMicrotask(() => handlers.onClose());
       return { send: () => {}, close: () => {} };
@@ -125,6 +153,8 @@ export function createFakeNetwork(): FakeNetwork {
       close: () => {
         connection.open = false;
         connections.delete(connection);
+        if (connection.replica !== null) presence.delete(connection.replica);
+        broadcastPresence();
       },
     };
   };

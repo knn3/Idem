@@ -122,3 +122,36 @@ export async function controlSocket(page: Page): Promise<SocketControl> {
     },
   };
 }
+
+/** Remote carets drawn in this page — one per connected peer. */
+export function peerCarets(page: Page): Locator {
+  return page.locator('[data-testid="peer-caret"]');
+}
+
+/**
+ * Waits until this page draws exactly one remote caret, at `offset`.
+ *
+ * Polls rather than asserts once: the offset settles after two round trips —
+ * the local recompute from anchors, then the peer's own presence message — and
+ * the settled value is the one the criterion is about.
+ */
+export async function expectPeerCaretAt(page: Page, offset: number): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        (
+          await peerCarets(page).evaluateAll((els) =>
+            els.map((el) => el.getAttribute('data-offset')),
+          )
+        ).join(),
+      { timeout: 15_000 },
+    )
+    .toBe(String(offset));
+}
+
+/** Places the local cursor at a visible offset, counting from the start of the document. */
+export async function placeCursor(page: Page, offset: number): Promise<void> {
+  await focusEditor(page);
+  await page.keyboard.press('ControlOrMeta+Home');
+  for (let i = 0; i < offset; i++) await page.keyboard.press('ArrowRight');
+}
