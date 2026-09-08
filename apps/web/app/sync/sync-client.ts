@@ -2,6 +2,7 @@ import { Doc, type Item, type Op, type OpId } from '@idem/crdt';
 import {
   parseServerMessage,
   serializeMessage,
+  type Peer,
   type ServerMessage,
   type Snapshot,
 } from '@idem/protocol';
@@ -42,6 +43,8 @@ export interface SyncClientOptions {
   /** Fired whenever the document text may have changed. */
   readonly onChange: () => void;
   readonly onState: (state: SyncState) => void;
+  /** Fired with the roster, this replica already removed. Empty while offline. */
+  readonly onPeers?: (peers: readonly Peer[]) => void;
   readonly connect?: Connect;
   readonly backoffMs?: readonly number[];
   readonly setTimer?: (fn: () => void, ms: number) => number;
@@ -112,6 +115,8 @@ export class SyncClient {
   private sinceSeq = 0;
   /** When the current connection's `hello` went out, for the M8 load-time report. */
   private helloSentAt = 0;
+  /** Last presence sent, so an unchanged cursor does not put a message on the wire. */
+  private sentPresence = '';
 
   constructor(options: SyncClientOptions) {
     this.options = options;
@@ -156,6 +161,26 @@ export class SyncClient {
     this.send(ops);
   }
 
+  /**
+   * Broadcasts this replica's cursor. Anchors only, never offsets (SPEC §8).
+   *
+   * Dropped silently while offline: presence is ephemeral, so a cursor position
+   * from a dead connection is worthless by the time it could be delivered —
+   * unlike an operation, which is queued precisely because it still matters
+   * later. The next move after reconnecting resends it.
+   *
+   * Identical positions are not resent. That is the only rate limiting here:
+   * every keystroke does put one small message on the wire, which at demo scale
+   * is far cheaper than the coalescing timer it would take to avoid.
+   */
+  setPresence(anchor: OpId | null, focus: OpId | null): void {
+    if (!this.socket || this.status !== 'online') return;
+    const key = JSON.stringify([anchor, focus]);
+    if (key === this.sentPresence) return;
+    this.sentPresence = key;
+    this.socket.send(serializeMessage({ t: 'presence', anchor, focus }));
+  }
+
   destroy(): void {
     this.destroyed = true;
     if (this.timer !== null) this.clearTimer(this.timer);
@@ -184,6 +209,13 @@ export class SyncClient {
       onClose: () => {
         this.socket = null;
         this.setStatus('offline');
+        // Peers are dropped on disconnect at both ends: the server tells the
+        // others, and this client forgets everyone rather than leaving frozen
+        // carets on screen for a room it can no longer see.
+        this.options.onPeers?.([]);
+        // A reconnect starts from an unknown position, so the next cursor move
+        // must go out even if it matches what the old connection last sent.
+        this.sentPresence = '';
         this.scheduleReconnect();
       },
     });
@@ -237,10 +269,14 @@ export class SyncClient {
       // That echo, carrying a `seq`, is the acknowledgement (SPEC §7).
       this.acknowledge(message.ops.map((op) => op.id));
       this.options.onChange();
+    } else if (message.t === 'presence') {
+      // Ephemeral (SPEC §8) — nothing here is stored or acknowledged. The
+      // roster includes this replica; drop it, since a client already knows
+      // where its own cursor is and drawing it twice is a visible bug.
+      this.options.onPeers?.(message.peers.filter((peer) => peer.replica !== this.options.replica));
     } else if (message.t === 'error') {
       console.error(`[idem] server rejected a message [${message.code}]: ${message.message}`);
     }
-    // 'presence' arrives in M10.
   }
 
   /**

@@ -1,6 +1,14 @@
 import { Doc } from '@idem/crdt';
-import type { Item, Op, OpId, WelcomeMessage } from '@idem/protocol';
+import {
+  serializeMessage,
+  type Item,
+  type Op,
+  type OpId,
+  type Peer,
+  type WelcomeMessage,
+} from '@idem/protocol';
 
+import { pickIdentity } from './presence.js';
 import type { OpStore, SeqOp } from './store.js';
 
 /**
@@ -59,6 +67,14 @@ export interface RoomOptions {
  * accelerator: the op log stays the source of truth, and if materialization
  * ever throws (a client sent an op that violates causal delivery) the snapshot
  * is skipped and everything still works from the log.
+ *
+ * ### Presence (M10)
+ *
+ * Cursors and selections live here too, and *only* here: presence is ephemeral
+ * (SPEC §8), so it is never handed to the store, never appears in `welcome`,
+ * and is gone the moment a socket closes. It is the one piece of room state
+ * that is allowed to be lost, which is why it is kept beside the durable state
+ * rather than inside it.
  */
 export class Room {
   readonly docId: string;
@@ -70,6 +86,8 @@ export class Room {
   private readonly tail: SeqOp[] = [];
   private readonly seen = new Set<string>();
   private readonly clients = new Map<string, RoomClient>();
+  /** Ephemeral, memory-only, in join order so the roster is stable between broadcasts. */
+  private readonly presence = new Map<string, Peer>();
   private readonly store: OpStore;
   private readonly snapshotInterval: number;
   private pending: Promise<void> = Promise.resolve();
@@ -106,12 +124,53 @@ export class Room {
     return room;
   }
 
+  /**
+   * Registers a client and gives it a presence entry with no cursor yet, so a
+   * peer shows up in the roster the moment it arrives rather than only once it
+   * has clicked somewhere.
+   *
+   * Broadcasting is deliberately *not* done here. The caller sends `welcome`
+   * first and then calls `broadcastPresence`, so a joining client can never be
+   * handed anchors for a document state it has not received.
+   */
   join(client: RoomClient): void {
     this.clients.set(client.replica, client);
+    const taken = new Set([...this.presence.values()].map((peer) => peer.name));
+    taken.delete(this.presence.get(client.replica)?.name ?? '');
+    const identity = pickIdentity(client.replica, taken);
+    this.presence.set(client.replica, {
+      replica: client.replica,
+      name: identity.name,
+      color: identity.color,
+      anchor: null,
+      focus: null,
+    });
   }
 
   leave(replica: string): void {
     this.clients.delete(replica);
+    this.presence.delete(replica);
+  }
+
+  /**
+   * Records a peer's cursor. Keeps the name and color already assigned at join
+   * — a moving cursor must not change identity mid-session.
+   */
+  setPresence(replica: string, anchor: OpId | null, focus: OpId | null): void {
+    const peer = this.presence.get(replica);
+    if (!peer) return; // the socket left between sending and delivery; nothing to update
+    this.presence.set(replica, { ...peer, anchor, focus });
+  }
+
+  /** The full roster. Every client gets all of it and filters itself out when rendering. */
+  peers(): Peer[] {
+    return [...this.presence.values()];
+  }
+
+  /** Sends the roster to every connected client. Ephemeral: nothing here is persisted. */
+  broadcastPresence(): void {
+    if (this.clients.size === 0) return;
+    this.broadcast(serializeMessage({ t: 'presence', peers: this.peers() }));
   }
 
   get clientCount(): number {
