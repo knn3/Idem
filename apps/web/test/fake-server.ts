@@ -1,5 +1,10 @@
 import { Doc, type Item, type Op, type OpId } from '@idem/crdt';
-import { parseClientMessage, serializeMessage, type Peer } from '@idem/protocol';
+import {
+  parseClientMessage,
+  serializeMessage,
+  type Peer,
+  type ServerMessage,
+} from '@idem/protocol';
 
 import type { Connect, SocketHandlers, SyncSocket } from '../app/sync/sync-client';
 
@@ -24,6 +29,15 @@ export interface FakeNetwork {
   setOnline(online: boolean): void;
   /** Materializes a snapshot and truncates the tail, as `Room.maybeSnapshot` does at its interval. */
   takeSnapshot(): void;
+  /**
+   * Pushes one message to every open socket, bypassing the room logic.
+   *
+   * For the states a correct server would never produce but a broken one does —
+   * a history with a hole in it, a room that has closed itself. Those have to
+   * be reachable in a test, because how the client behaves when the server is
+   * wrong is exactly what is under test.
+   */
+  deliverRaw(message: ServerMessage): void;
   /** Every operation the server has accepted, in `seq` order. */
   readonly log: readonly Op[];
   /** The server's own view of the text — what every converged client must agree with. */
@@ -164,6 +178,9 @@ export function createFakeNetwork(): FakeNetwork {
     setOnline(next) {
       online = next;
       if (!next) closeAll();
+    },
+    deliverRaw(message) {
+      broadcast(serializeMessage(message));
     },
     takeSnapshot() {
       const doc = materialize(

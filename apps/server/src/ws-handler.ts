@@ -6,7 +6,7 @@ import {
 } from '@idem/protocol';
 import type { RawData, WebSocket } from 'ws';
 
-import type { Room, RoomRegistry } from './rooms.js';
+import { RoomUnavailableError, type Room, type RoomRegistry } from './rooms.js';
 
 function sendError(ws: WebSocket, code: string, message: string): void {
   const payload: ErrorMessage = { t: 'error', code, message };
@@ -64,6 +64,11 @@ export function handleConnection(ws: WebSocket, registry: RoomRegistry): void {
         joined.room.broadcastPresence();
       } catch (err) {
         if (err instanceof ProtocolError) {
+          sendError(ws, err.code, err.message);
+        } else if (err instanceof RoomUnavailableError) {
+          // The client's operations are still in its outbox and it will resend
+          // them, so the honest thing is to say the edit did not land rather
+          // than let it look acknowledged.
           sendError(ws, err.code, err.message);
         } else {
           sendError(ws, 'internal-error', 'the server failed to process that message');

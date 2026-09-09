@@ -9,12 +9,14 @@ import {
 
 import { opKey, type Outbox } from './outbox';
 
-export type ConnectionStatus = 'connecting' | 'online' | 'offline';
+export type ConnectionStatus = 'connecting' | 'online' | 'offline' | 'error';
 
 export interface SyncState {
   readonly status: ConnectionStatus;
   /** Operations created but not yet acknowledged by the server. */
   readonly pending: number;
+  /** Set when `status` is 'error': what went wrong, in words a user can act on. */
+  readonly error?: string;
 }
 
 /** The transport, narrowed to what this client uses, so tests can supply their own. */
@@ -103,6 +105,7 @@ export class SyncClient {
   private currentDoc: Doc;
   private socket: SyncSocket | null = null;
   private status: ConnectionStatus = 'offline';
+  private error: string | null = null;
   private retries = 0;
   private timer: number | null = null;
   private destroyed = false;
@@ -135,7 +138,9 @@ export class SyncClient {
   }
 
   get state(): SyncState {
-    return { status: this.status, pending: this.pending.length };
+    return this.error === null
+      ? { status: this.status, pending: this.pending.length }
+      : { status: this.status, pending: this.pending.length, error: this.error };
   }
 
   /**
@@ -228,7 +233,7 @@ export class SyncClient {
    * turn it into a hot loop.
    */
   private scheduleReconnect(): void {
-    if (this.destroyed || this.timer !== null) return;
+    if (this.destroyed || this.timer !== null || this.status === 'error') return;
     const index = Math.min(this.retries, this.backoff.length - 1);
     // Non-empty by construction: the default has five entries and a caller-supplied
     // array is clamped to its own last index.
@@ -261,9 +266,31 @@ export class SyncClient {
     }
     if (message.t === 'welcome') {
       this.retries = 0;
-      this.applyWelcome(message.snapshot, message.ops, message.seq);
+      // A document the server cannot serve a replayable history for is fatal to
+      // this client, but it must not be fatal to the *page*: an uncaught throw
+      // here used to kill the editor mid-connect, which also stranded the
+      // outbox — the queue could never drain because the code that resends it
+      // never ran. Failing loudly and staying alive keeps those edits safe.
+      try {
+        this.applyWelcome(message.snapshot, message.ops, message.seq);
+      } catch (err) {
+        this.fail(
+          'This document could not be loaded: the server sent a history that cannot be ' +
+            'replayed. Your unsent edits are still queued. See docs/RECOVERY.md.',
+          err,
+        );
+      }
     } else if (message.t === 'ops') {
-      for (const op of message.ops) this.currentDoc.apply(op);
+      try {
+        for (const op of message.ops) this.currentDoc.apply(op);
+      } catch (err) {
+        this.fail(
+          'This document could not be updated: the server sent an operation that cannot be ' +
+            'applied. Your unsent edits are still queued. See docs/RECOVERY.md.',
+          err,
+        );
+        return;
+      }
       this.sinceSeq = message.seq;
       // A client's own operations are broadcast back to it (SPEC §6 step 4).
       // That echo, carrying a `seq`, is the acknowledgement (SPEC §7).
@@ -276,6 +303,10 @@ export class SyncClient {
       this.options.onPeers?.(message.peers.filter((peer) => peer.replica !== this.options.replica));
     } else if (message.t === 'error') {
       console.error(`[idem] server rejected a message [${message.code}]: ${message.message}`);
+      // A room that has closed itself cannot take this client's edits, and
+      // retrying would only produce the same answer. Say so, and keep the
+      // outbox intact for a server that comes back healthy.
+      if (message.code === 'E_ROOM_UNAVAILABLE') this.fail(message.message, null);
     }
   }
 
@@ -383,8 +414,27 @@ export class SyncClient {
     await this.writes;
   }
 
+  /**
+   * Stops this client for a reason retrying cannot fix, without losing the
+   * queue. The socket is closed and no reconnect is scheduled: the operations
+   * stay in IndexedDB, so a reload against a healthy server resends them.
+   */
+  private fail(message: string, cause: unknown): void {
+    if (cause !== null) console.error('[idem]', message, cause);
+    this.error = message;
+    this.status = 'error';
+    this.options.onPeers?.([]);
+    if (this.timer !== null) this.clearTimer(this.timer);
+    this.timer = null;
+    this.socket?.close();
+    this.socket = null;
+    this.emit();
+  }
+
   private setStatus(status: ConnectionStatus): void {
-    if (this.status === status) return;
+    // 'error' is terminal for this client — nothing may quietly promote it back
+    // to 'online' and imply the document is usable again.
+    if (this.status === 'error' || this.status === status) return;
     this.status = status;
     this.emit();
   }
