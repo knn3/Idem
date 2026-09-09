@@ -24,6 +24,22 @@ function opKey(id: OpId): string {
   return `${id.replica}:${id.lamport}`;
 }
 
+/**
+ * Thrown when a room has lost a durable write and can no longer be trusted to
+ * relay operations. Carries a code and says what to do about it.
+ */
+export class RoomUnavailableError extends Error {
+  readonly code = 'E_ROOM_UNAVAILABLE';
+  constructor(docId: string, cause: unknown) {
+    super(
+      `Document ${docId} stopped accepting operations because a write to the log failed. ` +
+        `Check the database and restart the server; edits made since the failure are still ` +
+        `queued in each client's outbox and will be resent.`,
+    );
+    this.cause = cause;
+  }
+}
+
 /** SPEC §9: snapshots are written every 500 operations. */
 export const SNAPSHOT_INTERVAL = 500;
 
@@ -91,6 +107,8 @@ export class Room {
   private readonly store: OpStore;
   private readonly snapshotInterval: number;
   private pending: Promise<void> = Promise.resolve();
+  /** Set by the first failed durable write. Non-null means the room is closed for business. */
+  private failure: unknown = null;
 
   private constructor(docId: string, store: OpStore, options: RoomOptions) {
     this.docId = docId;
@@ -213,6 +231,15 @@ export class Room {
    * no-op.
    */
   applyOps(ops: readonly Op[]): { seq: number; ops: Op[] } | null {
+    // A room that has lost a write must not accept more. Continuing would keep
+    // assigning `seq` and broadcasting operations on top of a hole in the log,
+    // and the moment one of those later operations *does* persist — a delete
+    // referencing an insert that never landed — the log is unreplayable
+    // forever: every future client crashes rebuilding it, and snapshots can
+    // never be materialized again. Refusing here is what keeps a transient
+    // database problem transient.
+    if (this.failure !== null) throw new RoomUnavailableError(this.docId, this.failure);
+
     const accepted: Op[] = [];
     const toPersist: SeqOp[] = [];
     for (const op of ops) {
@@ -251,10 +278,18 @@ export class Room {
       for (const { op } of this.tail) doc.apply(op);
       items = doc.items;
     } catch (err: unknown) {
-      // A snapshot is an optimization, never a gate. If a client sent an op
-      // that violates causal delivery, keep relaying from the log and try
-      // again at the next boundary rather than taking the room down.
-      console.error(`snapshot materialization failed for doc ${this.docId}:`, err);
+      // A snapshot is an optimization, never a gate, so this does not close the
+      // room — live clients holding the document are still consistent with each
+      // other and must keep working. But it is not routine either: the tail
+      // failing to replay means the stored log already cannot be rebuilt from,
+      // so every *new* client will fail to load it and snapshots will never
+      // succeed again. Loud, with a code, because it needs a human.
+      console.error(
+        `E_LOG_UNREPLAYABLE: snapshot materialization failed for doc ${this.docId}. ` +
+          `The stored log cannot be rebuilt — new clients will fail to load this document. ` +
+          `See docs/RECOVERY.md.`,
+        err,
+      );
       return;
     }
 
@@ -265,11 +300,26 @@ export class Room {
     this.enqueue(() => this.store.putSnapshot(this.docId, record), 'snapshot write');
   }
 
-  /** Serializes durable writes behind one chain so `flush` covers all of them and they land in order. */
+  /**
+   * Serializes durable writes behind one chain so `flush` covers all of them
+   * and they land in order.
+   *
+   * A failure here used to be logged and dropped. That is what silently
+   * corrupts the log: operations keep being acknowledged to clients while
+   * nothing reaches disk, and the damage is only discovered much later, by a
+   * client that cannot replay what it is sent. The room is now marked failed
+   * instead, and `applyOps` refuses everything after it.
+   */
   private enqueue(write: () => Promise<void>, what: string): void {
     this.pending = this.pending.then(write).catch((err: unknown) => {
-      console.error(`${what} failed for doc ${this.docId}:`, err);
+      console.error(`E_WRITE_FAILED: ${what} failed for doc ${this.docId}; room closed:`, err);
+      this.failure ??= err;
     });
+  }
+
+  /** Whether a durable write has failed. A failed room accepts no further operations. */
+  get failed(): boolean {
+    return this.failure !== null;
   }
 
   /** Awaits every write started so far. Not used on the live broadcast path — only by tests and graceful shutdown that need to know a write actually landed. */

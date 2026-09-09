@@ -307,3 +307,91 @@ describe('the headline demo', () => {
     expect(merged.endsWith('.')).toBe(true);
   });
 });
+
+describe('a document the server cannot serve', () => {
+  /**
+   * The client half of the same regression. A `welcome` carrying a history that
+   * cannot be replayed used to throw straight out of the message handler. That
+   * killed the page — and with it the code that resends the outbox, so the
+   * queue could never drain and the edits sat there looking permanent.
+   */
+  it('reports the failure instead of throwing out of the handler, and still captures edits', async () => {
+    const outbox = createMemoryOutbox();
+    const client = createClient('a', outbox);
+    await start(client);
+
+    // A delete for an item no insert ever created — a log with a hole in it,
+    // which is what a room that lost a write leaves behind.
+    net.deliverRaw({
+      t: 'welcome',
+      snapshot: { seq: 9, items: [] },
+      ops: [
+        {
+          kind: 'delete',
+          id: { lamport: 9, replica: 'ghost' },
+          target: { lamport: 1, replica: 'ghost' },
+        },
+      ],
+      seq: 9,
+    });
+    await settle();
+
+    expect(client.state.status).toBe('error');
+    expect(client.state.error).toMatch(/could not be loaded/);
+
+    // The whole point of not throwing: the client is still a working object, so
+    // anything typed after the failure is still queued and still durable rather
+    // than disappearing along with the page.
+    typeText(client, 0, 'mine');
+    await client.flushWrites();
+    expect(client.state.pending).toBe(4);
+    expect(await outbox.all()).toHaveLength(4);
+  });
+
+  it('stops retrying once it has failed, rather than reconnecting into the same wall', async () => {
+    const client = createClient('a');
+    await start(client);
+
+    net.deliverRaw({
+      t: 'welcome',
+      snapshot: { seq: 1, items: [] },
+      ops: [
+        {
+          kind: 'delete',
+          id: { lamport: 1, replica: 'ghost' },
+          target: { lamport: 7, replica: 'ghost' },
+        },
+      ],
+      seq: 1,
+    });
+    await settle();
+    expect(client.state.status).toBe('error');
+
+    const before = timers.delays.length;
+    await timers.run();
+    expect(timers.delays.length).toBe(before);
+    expect(client.state.status).toBe('error');
+  });
+
+  it('surfaces a room the server has closed, without discarding the queue', async () => {
+    const outbox = createMemoryOutbox();
+    const client = createClient('a', outbox);
+    await start(client);
+
+    net.deliverRaw({
+      t: 'error',
+      code: 'E_ROOM_UNAVAILABLE',
+      message: 'Document doc-1 stopped accepting operations because a write to the log failed.',
+    });
+    await settle();
+
+    expect(client.state.status).toBe('error');
+    expect(client.state.error).toMatch(/stopped accepting operations/);
+
+    // Edits made after the server gave up are still written to IndexedDB, which
+    // is what makes them survive until a healthy server is back.
+    typeText(client, 0, 'hi');
+    await client.flushWrites();
+    expect(await outbox.all()).toHaveLength(2);
+  });
+});

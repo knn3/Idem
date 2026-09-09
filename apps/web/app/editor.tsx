@@ -186,17 +186,19 @@ export function Editor() {
   );
 }
 
-const STATUS_LABEL = {
+const STATUS_LABEL: Record<SyncState['status'], string> = {
   online: 'Online',
   connecting: 'Connecting…',
   offline: 'Offline',
-} as const;
+  error: 'Stopped',
+};
 
-const STATUS_COLOR = {
+const STATUS_COLOR: Record<SyncState['status'], string> = {
   online: '#12805c',
   connecting: '#9a6700',
   offline: '#b42318',
-} as const;
+  error: '#b42318',
+};
 
 /**
  * The connection indicator. It reports the queue depth as well as the status,
@@ -205,6 +207,9 @@ const STATUS_COLOR = {
  */
 function ConnectionIndicator({ state }: { state: SyncState }) {
   const color = STATUS_COLOR[state.status];
+  // The queue depth is the reassurance while offline; when something has gone
+  // permanently wrong the message replaces it, because "3 edits queued" answers
+  // the wrong question if the document will never load.
   return (
     <p
       data-testid="connection-indicator"
@@ -224,9 +229,10 @@ function ConnectionIndicator({ state }: { state: SyncState }) {
       />
       <strong style={{ color }}>{STATUS_LABEL[state.status]}</strong>
       <span>
-        {state.pending === 0
-          ? 'all edits acknowledged'
-          : `${state.pending} edit${state.pending === 1 ? '' : 's'} queued`}
+        {state.error ??
+          (state.pending === 0
+            ? 'all edits acknowledged'
+            : `${state.pending} edit${state.pending === 1 ? '' : 's'} queued`)}
       </span>
     </p>
   );
